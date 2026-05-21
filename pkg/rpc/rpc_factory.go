@@ -92,7 +92,13 @@ func (rf *RpcFactory) NewBeRpc(be *base.Backend) (IBeRpc, error) {
 	rf.beRpcsLock.Unlock()
 
 	// create kitex BackendService client
-	addr := fmt.Sprintf("%s:%d", be.Host, be.BePort)
+	// Use GetBePort() to support external port mapping in Kubernetes NodePort scenarios
+	bePort := be.GetBePort()
+	addr := fmt.Sprintf("%s:%d", be.Host, bePort)
+
+	log.Debugf("Creating BeRpc client for backend %d: addr=%s (internal BePort=%d)",
+		be.Id, addr, be.BePort)
+
 	client, err := beservice.NewClient("BackendService",
 		client.WithHostPorts(addr),
 		client.WithConnectTimeout(connectTimeout),

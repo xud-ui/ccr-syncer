@@ -129,18 +129,43 @@ type FeRpc struct {
 	clients       map[string]IFeRpc
 	cachedFeAddrs map[string]bool
 	lock          sync.RWMutex // for get client
+
+	// Track which FE pod we're currently connected to (by internal hostname)
+	currentFeHostname string
 }
 
 func NewFeRpc(spec *base.Spec) (*FeRpc, error) {
+	// 【诊断日志8】打印创建 FeRpc 时的 Spec 配置
+	log.Infof("[DIAGNOSTIC] NewFeRpc - Creating FeRpc with spec:")
+	log.Infof("[DIAGNOSTIC]   Host: %s", spec.Host)
+	log.Infof("[DIAGNOSTIC]   Port: %s", spec.Port)
+	log.Infof("[DIAGNOSTIC]   ThriftPort: %s", spec.ThriftPort)
+	log.Infof("[DIAGNOSTIC]   User: %s", spec.User)
+	log.Infof("[DIAGNOSTIC]   Database: %s", spec.Database)
+	log.Infof("[DIAGNOSTIC]   Table: %s", spec.Table)
+	log.Infof("[DIAGNOSTIC]   Frontends count: %d", len(spec.Frontends))
+	for i, fe := range spec.Frontends {
+		log.Infof("[DIAGNOSTIC]     Frontend[%d]: Host=%s, Port=%s, ThriftPort=%s, IsMaster=%v",
+			i, fe.Host, fe.Port, fe.ThriftPort, fe.IsMaster)
+	}
+
+	// Priority 1: Use the configured Host/ThriftPort as initial masterClient
 	addr := fmt.Sprintf("%s:%s", spec.Host, spec.ThriftPort)
 	client, err := newSingleFeClient(addr)
 	if err != nil {
-		return nil, xerror.Wrapf(err, xerror.RPC, "NewFeClient error: %v", err)
+		return nil, xerror.Wrapf(err, xerror.RPC, "NewFeClient error: %v, addr: %s", err, addr)
 	}
 
 	clients := make(map[string]IFeRpc)
 	clients[client.Address()] = client
 	cachedFeAddrs := make(map[string]bool)
+
+	// 【诊断日志10】打印缓存的 FE 客户端地址
+	log.Infof("[DIAGNOSTIC] Adding cached FE clients:")
+
+	// Track if we found a master FE from the Frontends list
+	var masterClient IFeRpc = client // Default to configured host
+
 	for _, fe := range spec.Frontends {
 		addr := fmt.Sprintf("%s:%s", fe.Host, fe.ThriftPort)
 
@@ -153,13 +178,25 @@ func NewFeRpc(spec *base.Spec) (*FeRpc, error) {
 			log.Warnf("new fe client error: %+v", err)
 		} else {
 			clients[client.Address()] = client
+
+			// If this FE is marked as master, use it as masterClient
+			if fe.IsMaster {
+				log.Infof("[DIAGNOSTIC] Found master FE from Frontends list: %s", addr)
+				masterClient = client
+			}
 		}
 		cachedFeAddrs[addr] = true
 	}
 
+	// If we found a master FE, update masterClient
+	if masterClient != client {
+		log.Infof("[DIAGNOSTIC] Setting master client to: %s (was: %s)",
+			masterClient.Address(), client.Address())
+	}
+
 	return &FeRpc{
 		spec:          spec,
-		masterClient:  client,
+		masterClient:  masterClient,
 		clients:       clients,
 		cachedFeAddrs: cachedFeAddrs,
 	}, nil
@@ -275,17 +312,90 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call0(masterClient IFeRpc) 
 		}
 	}
 
+    // 增强日志：记录当前连接的 FE 是谁
+	log.Infof("Received NOT_MASTER response from FE [%s].", masterClient.Address())
+
 	// no compatible for master
 	if !resp.IsSetMasterAddress() {
-		err = xerror.XPanicWrapf(ErrFeNotMasterCompatible, "fe addr [%s]", masterClient.Address())
+	    log.Errorf("FE returned NOT_MASTER status but did NOT set MasterAddress. "+
+        "Current FE addr: [%s], Response status code: [%s], Response status message: [%s], "+
+        "IsSetMasterAddress: [false], IsSetStatus: [%v]",
+        masterClient.Address(),
+        resp.GetStatus().GetStatusCode().String(),
+        resp.GetStatus().GetErrorMsgs(),
+        resp)
+
+	    // Strategy 1: Try to find master FE from spec's Frontends list (marked with IsMaster=true)
+	    for _, fe := range r.rpc.spec.Frontends {
+	        if fe.IsMaster {
+	            masterAddr := fmt.Sprintf("%s:%s", fe.Host, fe.ThriftPort)
+
+	            // In NodePort scenario, all FEs share the same external address.
+	            // We need to force reconnect to let K8s LB route to a different pod.
+	            if len(r.rpc.spec.Frontends) > 1 && len(r.rpc.getClients()) == 1 {
+	                log.Infof("NodePort scenario: Found master FE marked in spec (IsMaster=true)")
+	                log.Infof("Forcing reconnection to %s to reach master FE pod", masterAddr)
+
+	                // Close current connection and create a new one
+	                // This will trigger K8s Service to potentially route to a different backend
+	                return &call0Result{
+	                    canUseNextAddr: true,
+	                    masterAddr:     masterAddr, // Same address, but will force reconnect
+	                    err:            xerror.Errorf(xerror.FE, "forcing reconnection to find master FE"),
+	                }
+	            }
+
+	            // Non-NodePort scenario: different addresses
+	            if masterAddr != masterClient.Address() {
+	                log.Infof("Found master FE from spec: %s (IsMaster=true), switching to it", masterAddr)
+
+	                // Try to get cached client or create new one
+	                client, ok := r.rpc.getClient(masterAddr)
+	                if !ok {
+	                    var err error
+	                    client, err = newSingleFeClient(masterAddr)
+	                    if err != nil {
+	                        log.Warnf("Failed to create client for master FE %s: %v", masterAddr, err)
+	                        continue
+	                    }
+	                    r.rpc.addClient(client)
+	                }
+
+	                r.rpc.updateMasterClient(client)
+	                return &call0Result{
+	                    canUseNextAddr: true,
+	                    masterAddr:     masterAddr,
+	                    err:            xerror.Errorf(xerror.FE, "switching to master FE %s", masterAddr),
+	                }
+	            }
+	        }
+	    }
+
+	    // Strategy 2: In Kubernetes NodePort scenario, retry with delay
+	    // K8s Service may route to different FE pod on reconnection
+	    if len(r.rpc.spec.Frontends) > 0 && len(r.rpc.getClients()) == 1 {
+	        log.Infof("NodePort scenario detected: only one FE address available")
+	        log.Infof("Will retry connection after delay, K8s Service may route to master FE pod")
+
+	        return &call0Result{
+	            canUseNextAddr: true,
+	            err:            xerror.Errorf(xerror.FE, "will retry in NodePort scenario"),
+	        }
+	    }
+
+        // Fallback: try other cached FE clients
+	    log.Infof("Will try other cached FE clients to find the master")
+	    err = xerror.Errorf(xerror.FE, "addr [%s] is not master and MasterAddress not set, will try other FEs", masterClient.Address())
 		return &call0Result{
 			canUseNextAddr: true,
-			err:            err, // not nil
+			err:            err,
 		}
 	}
 
 	// switch to master
 	masterAddr := resp.GetMasterAddress()
+	log.Infof("FE redirected to master. Current FE addr: [%s], Master addr: [%s:%d]",
+    masterClient.Address(), masterAddr.Hostname, masterAddr.Port)
 	err = xerror.Errorf(xerror.FE, "addr [%s] is not master", masterAddr)
 
 	// convert private ip to public ip, if need
@@ -301,11 +411,17 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call0(masterClient IFeRpc) 
 			}
 		}
 	}
+	// 关键修改：使用配置的 ThriftPort 而不是 FE 返回的 Port
+	// 在 Kubernetes NodePort 场景下，FE 返回的是内部端口（如 9020），但外部访问需要使用配置的 ThriftPort
+	thriftPort := r.rpc.spec.ThriftPort
+	log.Infof("Using configured ThriftPort %s instead of FE returned port %d for Kubernetes NodePort scenario",
+	    thriftPort, masterAddr.Port)
 
+	err = xerror.Errorf(xerror.FE, "addr [%s] is not master", masterAddr)
 	return &call0Result{
 		canUseNextAddr: true,
 		resp:           resp,
-		masterAddr:     fmt.Sprintf("%s:%d", hostname, masterAddr.Port),
+		masterAddr:     fmt.Sprintf("%s:%s", hostname, thriftPort),
 		err:            err, // not nil
 	}
 }
@@ -340,17 +456,36 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call() (RetryCall, resultTy
 		masterAddr := result.masterAddr
 		log.Infof("switch to master %s", masterAddr)
 
-		var err error
-		client, ok := rpc.getClient(masterAddr)
-		if ok {
-			masterClient = client
-		} else {
-			masterClient, err = newSingleFeClient(masterAddr)
+		// Check if this is a NodePort reconnection scenario (same address, but need fresh connection)
+		if masterAddr == masterClient.Address() && len(rpc.spec.Frontends) > 1 && len(rpc.getClients()) == 1 {
+			log.Infof("NodePort scenario: forcing new connection to same address %s", masterAddr)
+			log.Infof("This will allow K8s Service to route to a different FE pod")
+
+			// Create a completely new client (this closes old connection implicitly)
+			newClient, err := newSingleFeClient(masterAddr)
 			if err != nil {
-				return RetryCallNone, nil, xerror.Wrapf(err, xerror.RPC, "NewFeClient [%s] error: %v", masterAddr, err)
+				log.Warnf("Failed to create new client for %s: %v, will reuse existing", masterAddr, err)
+				// If failed to create new client, continue with existing
+			} else {
+				// Replace the old client with the new one
+				rpc.updateMasterClient(newClient)
+				log.Infof("Successfully created new connection to %s", masterAddr)
 			}
+		} else {
+			// Normal scenario: different address
+			var err error
+			client, ok := rpc.getClient(masterAddr)
+			if ok {
+				masterClient = client
+			} else {
+				masterClient, err = newSingleFeClient(masterAddr)
+				if err != nil {
+					return RetryCallNone, nil, xerror.Wrapf(err, xerror.RPC, "NewFeClient [%s] error: %v", masterAddr, err)
+				}
+			}
+			rpc.updateMasterClient(masterClient)
 		}
-		rpc.updateMasterClient(masterClient)
+
 		return RetryCallImmediate, nil, nil
 	}
 
@@ -359,9 +494,34 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call() (RetryCall, resultTy
 		r.notriedClients = rpc.getClients()
 	}
 	delete(r.notriedClients, masterClient.Address())
+
+	// If no other clients available, check if we should retry (NodePort scenario)
 	if len(r.notriedClients) == 0 {
+		// Only retry if we have a single FE address (NodePort scenario)
+		if len(rpc.getClients()) == 1 {
+			log.Infof("NodePort scenario: only one FE address, retrying same address")
+			log.Infof("Will create new connection to allow K8s LB to route differently")
+
+			// Force create a new connection by creating a new client
+			addr := masterClient.Address()
+			newClient, err := newSingleFeClient(addr)
+			if err != nil {
+				log.Warnf("Failed to create new client: %v, will retry with existing", err)
+			} else {
+				rpc.updateMasterClient(newClient)
+				log.Infof("Created new connection for retry")
+			}
+
+			// Reset notriedClients to allow retry
+			r.notriedClients = rpc.getClients()
+
+			// Use delayed retry
+			return RetryCallDelayed, nil, nil
+		}
+
 		return RetryCallNone, nil, result.err
 	}
+
 	// get first notried client
 	var client IFeRpc
 	for _, client = range r.notriedClients {
@@ -377,6 +537,21 @@ func (rpc *FeRpc) callWithMasterRedirect(caller callerType) (resultType, error) 
 		rpc:    rpc,
 		caller: caller,
 	}
+	retryCount := 0
+
+	// Calculate max retries based on number of unique FE addresses
+	numClients := len(rpc.getClients())
+	maxRetries := numClients * 3
+
+	// In NodePort scenario (single address), allow more retries
+	// Because we need to retry until K8s LB routes to the master FE pod
+	if numClients == 1 && len(rpc.spec.Frontends) > 1 {
+		// Allow up to 30 retries (with increasing delay, total ~30 seconds)
+		maxRetries = 30
+		log.Infof("NodePort scenario: adjusted max retries to %d (based on %d Frontends)",
+			maxRetries, len(rpc.spec.Frontends))
+	}
+
 	for {
 		retryCall, resultType, err := r.call()
 		if err != nil {
@@ -388,7 +563,21 @@ func (rpc *FeRpc) callWithMasterRedirect(caller callerType) (resultType, error) 
 		case RetryCallImmediate:
 			continue
 		case RetryCallDelayed:
-			time.Sleep(100 * time.Millisecond) // TODO: support exponential backoff
+			retryCount++
+			if retryCount > maxRetries {
+				return nil, xerror.Errorf(xerror.FE, "exceeded max retries (%d) while looking for master", maxRetries)
+			}
+
+			// Adaptive delay: longer wait for subsequent retries
+			// Start with 200ms, increase by 100ms each retry, cap at 2s
+			delay := time.Duration(200+retryCount*100) * time.Millisecond
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+
+			log.Infof("Retry attempt %d/%d, waiting %v before reconnecting...",
+				retryCount, maxRetries, delay)
+			time.Sleep(delay)
 			continue
 		default:
 			panic("unknown retry call")

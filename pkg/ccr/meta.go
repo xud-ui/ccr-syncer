@@ -689,16 +689,91 @@ func (m *Meta) GetBackends() ([]*base.Backend, error) {
 		backend := *backend // copy
 		backends = append(backends, &backend)
 	}
+
+	// Apply host and port mapping
 	if len(m.HostMapping) != 0 {
-		for _, backend := range backends {
+		log.Infof("[DIAGNOSTIC] GetBackends - Applying HostMapping, count: %d", len(m.HostMapping))
+
+		for i, backend := range backends {
+			originalHost := backend.Host
+			originalHttpPort := backend.HttpPort
+			originalBePort := backend.BePort
+
+			log.Infof("[DIAGNOSTIC]   Raw Backend[%d]: Id=%d, Host=%s, HttpPort=%d, BePort=%d, BrpcPort=%d",
+				i, backend.Id, backend.Host, backend.HttpPort, backend.BePort, backend.BrpcPort)
+
+			// Step 1: Apply host mapping
 			if host, ok := m.HostMapping[backend.Host]; ok {
 				backend.Host = host
+				log.Debugf("Applied Host mapping for BE %d: %s -> %s", backend.Id, originalHost, host)
 			} else {
-				return nil, xerror.Errorf(xerror.Normal,
-					"the public ip of host %s is not found, consider adding it via HTTP API /add_host_mapping", backend.Host)
+				log.Warnf("No Host mapping found for BE %d (%s), keeping original", backend.Id, backend.Host)
 			}
+
+			// Step 2: Apply HTTP port mapping
+			// Try multiple strategies to support different scenarios:
+
+			// Strategy 1: Use BE ID as key (e.g., "be-10006-http" -> "30004")
+			beIdHttpKey := fmt.Sprintf("be-%d-http", backend.Id)
+			if externalPortStr, ok := m.HostMapping[beIdHttpKey]; ok {
+				if externalPort, err := strconv.ParseUint(externalPortStr, 10, 16); err == nil {
+					backend.ExternalHttpPort = uint16(externalPort)
+					log.Infof("[DIAGNOSTIC] Applied HTTP port mapping for BE %d using ID key: %s -> %s",
+						backend.Id, beIdHttpKey, externalPortStr)
+				} else {
+					log.Warnf("Failed to parse external port '%s' for BE %d: %v", externalPortStr, backend.Id, err)
+				}
+			} else {
+				// Strategy 2: Try host:port key (e.g., "172.29.16.58:8040" -> "30004")
+				portKey := fmt.Sprintf("%s:%d", backend.Host, originalHttpPort)
+				if externalPortStr, ok := m.HostMapping[portKey]; ok {
+					if externalPort, err := strconv.ParseUint(externalPortStr, 10, 16); err == nil {
+						backend.ExternalHttpPort = uint16(externalPort)
+						log.Infof("[DIAGNOSTIC] Applied HTTP port mapping for BE %d: %s -> %s (key: %s)",
+							backend.Id, originalHttpPort, externalPortStr, portKey)
+					} else {
+						log.Warnf("Failed to parse external port '%s' for BE %d: %v", externalPortStr, backend.Id, err)
+					}
+				} else {
+					log.Debugf("No HTTP port mapping for BE %d (tried keys: %s, %s)",
+						backend.Id, beIdHttpKey, portKey)
+				}
+			}
+
+			// Step 3: Apply BePort (Thrift) mapping
+			// Strategy 1: Use BE ID as key (e.g., "be-10006-thrift" -> "30005")
+			beIdThriftKey := fmt.Sprintf("be-%d-thrift", backend.Id)
+			if externalBePortStr, ok := m.HostMapping[beIdThriftKey]; ok {
+				if externalBePort, err := strconv.ParseUint(externalBePortStr, 10, 16); err == nil {
+					backend.ExternalBePort = uint16(externalBePort)
+					log.Infof("[DIAGNOSTIC] Applied BePort mapping for BE %d using ID key: %s -> %s",
+						backend.Id, beIdThriftKey, externalBePortStr)
+				} else {
+					log.Warnf("Failed to parse external BePort '%s' for BE %d: %v", externalBePortStr, backend.Id, err)
+				}
+			} else {
+				// Strategy 2: Try host:port key (e.g., "172.29.16.58:9060" -> "30005")
+				bePortKey := fmt.Sprintf("%s:%d", backend.Host, originalBePort)
+				if externalBePortStr, ok := m.HostMapping[bePortKey]; ok {
+					if externalBePort, err := strconv.ParseUint(externalBePortStr, 10, 16); err == nil {
+						backend.ExternalBePort = uint16(externalBePort)
+						log.Infof("[DIAGNOSTIC] Applied BePort mapping for BE %d: %s -> %s (key: %s)",
+							backend.Id, originalBePort, externalBePortStr, bePortKey)
+					} else {
+						log.Warnf("Failed to parse external BePort '%s' for BE %d: %v", externalBePortStr, backend.Id, err)
+					}
+				} else {
+					log.Debugf("No BePort mapping for BE %d (tried keys: %s, %s)",
+						backend.Id, beIdThriftKey, bePortKey)
+				}
+			}
+
+			log.Infof("[DIAGNOSTIC]   Final Backend[%d]: Id=%d, Host=%s, HttpPort=%d, ExternalHttpPort=%d, BePort=%d, ExternalBePort=%d",
+				i, backend.Id, backend.Host, backend.HttpPort, backend.ExternalHttpPort, backend.BePort, backend.ExternalBePort)
 		}
 	}
+
+	log.Infof("[DIAGNOSTIC] GetBackends - Final backends count: %d", len(backends))
 	return backends, nil
 }
 
@@ -1276,8 +1351,10 @@ func (m *Meta) checkBEsBinlogFeature() error {
 
 	var disabledBinlogBEs []string
 	for _, backend := range backends {
+		// Use GetHttpPortStr() to support external port mapping in Kubernetes
+		httpPortStr := backend.GetHttpPortStr()
 		url := fmt.Sprintf("http://%v:%v/api/show_config?conf_item=enable_feature_binlog",
-			backend.Host, backend.HttpPort)
+			backend.Host, httpPortStr)
 		resp, err := http.Get(url)
 		if err != nil {
 			return xerror.Wrapf(err, xerror.Normal, "get url: %s failed", url)

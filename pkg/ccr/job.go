@@ -411,9 +411,19 @@ func (j *Job) genExtraInfo() (*base.ExtraInfo, error) {
 	beNetworkMap := make(map[int64]base.NetworkAddr)
 	for _, backend := range backends {
 		log.Infof("gen extra info with backend: %v", backend)
+
+		// 关键修改：在 Kubernetes NodePort 场景下，使用 ExternalHttpPort 而不是 HttpPort
+		// 如果 ExternalHttpPort 为 0 或未设置，则回退到 HttpPort
+		httpPort := backend.HttpPort
+		if backend.ExternalHttpPort > 0 {
+			httpPort = backend.ExternalHttpPort
+			log.Infof("Using ExternalHttpPort %d instead of HttpPort %d for Kubernetes NodePort scenario",
+				backend.ExternalHttpPort, backend.HttpPort)
+		}
+
 		addr := base.NetworkAddr{
 			Ip:   backend.Host,
-			Port: backend.HttpPort,
+			Port: httpPort,
 		}
 		beNetworkMap[backend.Id] = addr
 	}
